@@ -1,0 +1,315 @@
+---
+title: "RNA-seq Analysis
+author: "Dorthy Fang, Sigrid Nachtergaele, Emily Dangelmaier"
+date: "9/17/2024"
+output: html_document
+---
+
+##Note that this code is for using quant files from salmon
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## First: Load library packages for RNA-seq analysis.
+
+```{r library, include=FALSE}
+load('/vast/palmer/scratch/nachtergaele/ead79/DESeq2_results/dds_H.rda')
+
+#install.packages('Rsamtools')
+#BiocManager::install("Rsamtools")
+#install.packages('GenomicFeatures')
+#BiocManager::install("GenomicFeatures")
+#BiocManager::install("vsn")
+
+library('DESeq2')
+library('Rsamtools')
+library('GenomicFeatures')
+library("GenomicAlignments")
+library("BiocParallel")
+library("magrittr")
+library("vsn")
+library(DESeq2)
+library(tximport)
+library(readr) # For read_csv() if needed
+library("pheatmap")
+library("RColorBrewer")
+library("PoiClaClu")
+
+library("dplyr")
+library("ggplot2")
+```
+#Read in salmon quant files 
+```{r}
+#files are in SampleID_quant.sf name format
+salmon_files <- list.files(path = "/vast/palmer/scratch/nachtergaele/ead79/DESeq2_results", pattern = "quant.sf", full.names = TRUE)
+
+#makes a sample_names list that is the prefixes of the file names, removing _quant.sf
+sample_names <- gsub("_quant.sf", "", basename(salmon_files))
+
+#sample table contains sample names WHICH MATCH sample_names list, then conditions / treatments
+sample_info <- read.table("/vast/palmer/scratch/nachtergaele/ead79/DESeq2_results/samples.txt", header = TRUE, sep = "\t")
+
+# Imported the tx2gene file from the tutorial I was following
+#https://github.com/CebolaLab/RNA-seq/blob/master/tx2gene_gencodev36-unique.txt
+tx2gene = read.table('/vast/palmer/scratch/nachtergaele/ead79/DESeq2_results/tx2gene_gencodev36-unique.txt', sep = '\t')
+counts.imported = tximport(files = salmon_files, type = 'salmon', tx2gene = tx2gene)
+
+# 4.1 Pre-filtering the dataset
+dds <- DESeqDataSetFromTximport(counts.imported, colData = sample_info, design = ~ Condition)
+nrow(dds)
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+nrow(dds)
+
+# Save the DDS object and use it for further analysis.
+save.image('dds.rda')
+
+```
+
+## Transformations
+
+```{r}
+# remove METTL7A as one of the genes, since it's already so ectopically overexpressed
+#dds = dds[names(dds)!="METTL7A",]
+
+vsd = vst(dds, blind = FALSE)
+head(assay(vsd), 3)
+
+rld = rlog(dds, blind = FALSE)
+head(assay(rld), 3)
+
+dds = estimateSizeFactors(dds)
+```
+
+## Plot Transformations
+
+```{r echo=FALSE}
+df <- bind_rows(
+  as_tibble(log2(counts(dds, normalized=TRUE)[, 1:2]+1)) %>%
+    mutate(transformation = "log2(x + 1)"),
+  as_tibble(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"),
+  as_tibble(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+
+colnames(df)[1:2] <- c("x", "y")  
+
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)
+```
+
+## Sample Distances
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+sampleDists
+```
+
+#### Sample Distances Matrix
+```{r echo=FALSE}
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( vsd$Sample, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+```
+#### Poisson Distances
+```{r echo=FALSE}
+poisd <- PoissonDistance(t(counts(dds)))
+
+samplePoisDistMatrix <- as.matrix( poisd$dd )
+rownames(samplePoisDistMatrix) <- paste( dds$Sample, sep=" - " )
+colnames(samplePoisDistMatrix) <- NULL
+pheatmap(samplePoisDistMatrix,
+         clustering_distance_rows = poisd$dd,
+         clustering_distance_cols = poisd$dd,
+         col = colors)
+```
+
+### PCA Analysis
+#### Plot PCA using the VST data
+```{r echo=FALSE}
+plotPCA(vsd, intgroup = c("Condition"))
+
+pcaData <- plotPCA(vsd, intgroup = c( "Condition"), returnData = TRUE)
+pcaData
+
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+ggplot(pcaData, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size =3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed()
+```
+
+### MDS (Multidimensional Scaling) Plot
+```{r echo=FALSE}
+mds <- as.data.frame(colData(vsd))  %>%
+         cbind(cmdscale(sampleDistMatrix))
+ggplot(mds, aes(x = `1`, y = `2`, color = Condition)) +
+  geom_point(size = 3) + coord_fixed()
+```
+
+Sample plot but for the Poisson Distance:
+
+```{r echo=FALSE}
+mdsPois <- as.data.frame(colData(dds)) %>%
+   cbind(cmdscale(samplePoisDistMatrix))
+ggplot(mdsPois, aes(x = `1`, y = `2`, color = Condition)) +
+  geom_point(size = 3) + coord_fixed()
+```
+
+# Differential Expression Analysis
+
+## Running the differential expression pipeline
+```{r include=FALSE}
+dds <- DESeq(dds)
+
+#normalize and save normalized counts as csv
+Counts <- counts(dds, normalized = TRUE)
+write.csv(as.data.frame(Counts), file = "/vast/palmer/scratch/nachtergaele/ead79/DESeq2_results/Condition_normCounts.csv")
+
+```
+
+## Building the results table
+```{r}
+#Build and output the results table
+res = results(dds)
+res
+write.csv(as.data.frame(res), file = "/vast/palmer/scratch/nachtergaele/ead79/DESeq2_results/Condition_res.csv")
+
+mcols(res, use.names = TRUE)
+
+summary(res)
+
+res.05 <- results(dds, alpha = 0.05)
+table(res.05$padj < 0.05)
+
+resLFC1 <- results(dds, lfcThreshold=1)
+table(resLFC1$padj < 0.1)
+```
+
+### Multiple Testing
+In high-throughput biology, we are careful to not use the p values directly as evidence against the null, but to correct for multiple testing. What would happen if we were to simply threshold the p values at a low value, say 0.05? For instance, there are 3058 genes with a p value below 0.05 among the 19804 genes for which the test succeeded in reporting a p value
+```{r}
+sum(res$pvalue < 0.05, na.rm=TRUE)
+```
+```{r}
+sum(!is.na(res$pvalue))
+```
+Now, assume for a moment that the null hypothesis is true for all genes. Then, by the definition of the p value, we expect up to 5% of the genes to have a p value below 0.05. This amounts to 990 genes in this case. If we just considered the list of genes with a p value below 0.05 as differentially expressed, this list should therefore be expected to contain up to 990 / 3058 = 32% false positives.
+
+DESeq2 uses the Benjamini-Hochberg (BH) adjustment (Benjamini and Hochberg 1995) as implemented in the base R p.adjust function; in brief, this method calculates for each gene an adjusted p value that answers the following question: if one called significant all genes with an adjusted p value less than or equal to this gene’s adjusted p value threshold, what would be the fraction of false positives (the false discovery rate, FDR) among them, in the sense of the calculation outlined above? These values, called the BH-adjusted p values, are given in the column padj of the res object.
+
+The FDR is a useful statistic for many high-throughput experiments, as we are often interested in reporting or focusing on a set of interesting genes, and we would like to put an upper bound on the percent of false positives in this set.
+
+Hence, if we consider a fraction of 10% false positives acceptable, we can consider all genes with an adjusted p value below 10% = 0.1 as significant. How many such genes are there?
+
+```{r}
+sum(res$padj < 0.1, na.rm=TRUE)
+```
+We subset the results table to these genes and then sort it by the log2 fold change estimate to get the significant genes with the strongest down-regulation:
+
+```{r}
+#make a table of results ONLY with p-adjusted values <0.1
+resSig <- subset(res, padj < 0.1)
+write.csv(as.data.frame(resSig),file="/vast/palmer/scratch/nachtergaele/ead79/DESeq2_results/resSig.csv")
+head(resSig[ order(resSig$log2FoldChange), ], 11)
+
+```
+…and with the strongest up-regulation:
+```{r}
+head(resSig[ order(resSig$log2FoldChange, decreasing = TRUE), ], 11)
+```
+
+# Plotting Results
+
+## Counts Plot
+A quick way to visualize the counts for a particular gene is to use the plotCounts function that takes as arguments the DESeqDataSet, a gene name, and the group over which to plot the counts (figure below).
+
+```{r, echo=FALSE}
+topGene <- rownames(res)[which.min(res$padj)]
+plotCounts(dds, gene = topGene, intgroup=c("Condition"))
+plotCounts(dds, gene = 'ENSG00000170430.10', intgroup=c("Condition"))
+```
+
+#### Normalized counts for a single gene over a treatment group
+```{r, echo=FALSE}
+library("ggbeeswarm")
+geneCounts <- plotCounts(dds, gene = topGene, intgroup = c("Condition"),
+                         returnData = TRUE)
+ggplot(geneCounts, aes(x = Condition, y = count)) +
+  scale_y_log10() +  geom_beeswarm(cex = 3)
+```
+
+## MA-Plot
+An MA-plot (Dudoit et al. 2002) provides a useful overview for the distribution of the estimated coefficients in the model, e.g. the comparisons of interest, across all genes. On the y-axis, the “M” stands for “minus” – subtraction of log values is equivalent to the log of the ratio – and on the x-axis, the “A” stands for “average”. You may hear this plot also referred to as a mean-difference plot, or a Bland-Altman plot.
+
+Before making the MA-plot, we use the lfcShrink function to shrink the log2 fold changes for the comparison of dex treated vs untreated samples. There are three types of shrinkage estimators in DESeq2, which are covered in the DESeq2 vignette. Here we specify the apeglm method for shrinking coefficients, which is good for shrinking the noisy LFC estimates while giving low bias LFC estimates for true large differences (Zhu, Ibrahim, and Love 2018). To use apeglm we specify a coefficient from the model to shrink, either by name or number as the coefficient appears in  resultsNames(dds).
+
+The log2 fold change for a particular comparison is plotted on the y-axis and the average of the counts normalized by size factor is shown on the x-axis. Each gene is represented with a dot. Genes with an adjusted p value below a threshold (here 0.1, the default) are shown in red.
+
+```{r}
+library("apeglm")
+resultsNames(dds)
+```
+```{r}
+res <- lfcShrink(dds, coef="condition_7A_vs_WT", type="apeglm")
+plotMA(res, ylim = c(-5, 5))
+topGene <- rownames(res)[which.min(res$padj)]
+```
+
+
+Another useful diagnostic plot is the histogram of the p values (figure below). This plot is best formed by excluding genes with very small counts, which otherwise generate spikes in the histogram.
+```{r}
+hist(res$pvalue[res$baseMean > 1], breaks = 0:20/20,
+     col = "grey50", border = "white")
+```
+
+## Gene Clustering
+In the sample distance heatmap made previously, the dendrogram at the side shows us a hierarchical clustering of the samples. Such a clustering can also be performed for the genes. Since the clustering is only relevant for genes that actually carry a signal, one usually would only cluster a subset of the most highly variable genes. Here, for demonstration, let us select the 20 genes with the highest variance across samples. We will work with the VST data.
+```{r echo=FALSE}
+library("genefilter")
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+```
+The heatmap becomes more interesting if we do not look at absolute expression strength but rather at the amount by which each gene deviates in a specific sample from the gene’s average across all samples. Hence, we center each genes’ values across samples, and plot a heatmap (figure below). We provide a data.frame that instructs the pheatmap function how to label the columns.
+```{r}
+mat  <- assay(vsd)[ topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)[, c("Condition")])
+pheatmap(mat, annotation_col = anno)
+```
+
+## Independent Filtering
+The MA plot highlights an important property of RNA-seq data. For weakly expressed genes, we have no chance of seeing differential expression, because the low read counts suffer from such high Poisson noise that any biological effect is drowned in the uncertainties from the sampling at a low rate. We can also show this by examining the ratio of small p values (say, less than 0.05) for genes binned by mean normalized count. We will use the results table subjected to the threshold to show what this looks like in a case when there are few tests with small p value.
+
+In the following code chunk, we create bins using the quantile function, bin the genes by base mean using cut, rename the levels of the bins using the middle point, calculate the ratio of p values less than 0.05 for each bin, and finally plot these ratios (figure below).
+
+```{r fig.cap="The ratio of small p values for genes binned by mean normalized count."}
+qs <- c(0, quantile(resLFC1$baseMean[resLFC1$baseMean > 0], 0:6/6))
+bins <- cut(resLFC1$baseMean, qs)
+levels(bins) <- paste0("~", round(signif((qs[-1] + qs[-length(qs)])/2, 2)))
+fractionSig <- tapply(resLFC1$pvalue, bins, function(p)
+                          mean(p < .05, na.rm = TRUE))
+barplot(fractionSig, xlab = "mean normalized count",
+                     ylab = "fraction of small p values")
+```
+The p values are from a test of log2 fold change greater than 1 or less than -1. This plot demonstrates that genes with very low mean count have little or no power, and are best excluded from testing.
+
+# Annotating and Exporting Results
+```{r}
+resOrdered <- res[order(res$pvalue),]
+head(resOrdered)
+
+resOrderedDF <- as.data.frame(resOrdered)[1:2000, ]
+write.csv(resOrderedDF, file = "mettl5.csv")
+```
+
+# Session Information
+As the last part of this document, we call the function sessionInfo, which reports the version numbers of R and all the packages used in this session. It is good practice to always keep such a record of this as it will help to track down what has happened in case an R script ceases to work or gives different results because the functions have been changed in a newer version of one of your packages. By including it at the bottom of a script, your reports will become more reproducible.
+
+```{r}
+devtools::session_info()
+```
+
